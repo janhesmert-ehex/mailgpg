@@ -59,11 +59,12 @@ final class GPGKeyManagementTests: XCTestCase {
         }
         sem.wait()
 
+        // The fixture holds two secret keys on one address (RSA + ECC).
         let k = try XCTUnwrap(keys)
-        XCTAssertEqual(k.count, 1)
-        XCTAssertEqual(k[0].fingerprint, homedir.fingerprint)
-        XCTAssertEqual(k[0].email, homedir.email)
-        XCTAssertTrue(k[0].hasSecretKey)
+        XCTAssertEqual(Set(k.map(\.fingerprint)),
+                       [homedir.fingerprint, homedir.secondFingerprint])
+        XCTAssertTrue(k.allSatisfy { $0.normalizedEmails == [homedir.email] })
+        XCTAssertTrue(k.allSatisfy(\.hasSecretKey))
     }
 
     func testListPublicKeys() throws {
@@ -77,11 +78,11 @@ final class GPGKeyManagementTests: XCTestCase {
         sem.wait()
 
         let k = try XCTUnwrap(keys)
-        XCTAssertEqual(k.count, 1)
-        XCTAssertEqual(k[0].fingerprint, homedir.fingerprint)
-        XCTAssertFalse(k[0].isRevoked)
+        XCTAssertEqual(Set(k.map(\.fingerprint)),
+                       [homedir.fingerprint, homedir.secondFingerprint])
+        XCTAssertFalse(k.contains(where: \.isRevoked))
         // listPublicKeys passes wantSecretKeys:false — hasSecretKey must be false
-        XCTAssertFalse(k[0].hasSecretKey)
+        XCTAssertFalse(k.contains(where: \.hasSecretKey))
     }
 
     // MARK: - Import / Export
@@ -142,7 +143,9 @@ final class GPGKeyManagementTests: XCTestCase {
             listSem.signal()
         }
         listSem.wait()
-        XCTAssertEqual(keys?.count ?? -1, 0, "Key should have been deleted")
+        // The fixture's second key on the same address is untouched.
+        XCTAssertEqual(keys?.map(\.fingerprint) ?? [], [homedir.secondFingerprint],
+                       "Only the requested key should have been deleted")
     }
 
     func testDeleteKeyRejectsInvalidFingerprint() {

@@ -21,11 +21,31 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
     /// threads concurrently — without a lock they all miss the cache and start
     /// parallel GPG decrypts of the same 17 MB message.
     private let cacheLock = NSLock()
+    /// Cache keys in least-recently-stored-first order, so the cache can be bounded.
+    /// Entries hold whole `MEDecodedMessage` payloads and have no TTL; the only
+    /// eviction used to be `clearUUIDCache()` from `mailComposeSessionDidEnd`, so a
+    /// Mail session that never opens a compose window grew this without limit.
+    private var cacheOrder: [String] = []
+    private static let cacheLimit = 128
 
     struct UUIDCacheEntry {
         let encodeResult: MEMessageEncodingResult?
         let decodedMessage: MEDecodedMessage?
         let isNotMailGPGContent: Bool
+        /// Size of the message body the "not MailGPG content" verdict was reached on.
+        /// A later call with MORE bytes is a different message as far as the sniff is
+        /// concerned, so the verdict must be re-taken. See `isCachedNotMailGPGContent`.
+        let notMailGPGSize: Int
+
+        init(encodeResult: MEMessageEncodingResult?,
+             decodedMessage: MEDecodedMessage?,
+             isNotMailGPGContent: Bool,
+             notMailGPGSize: Int = 0) {
+            self.encodeResult = encodeResult
+            self.decodedMessage = decodedMessage
+            self.isNotMailGPGContent = isNotMailGPGContent
+            self.notMailGPGSize = notMailGPGSize
+        }
     }
 
     private nonisolated static let inlinePGPMessageMarker = Data("-----BEGIN PGP MESSAGE-----".utf8)
@@ -47,39 +67,73 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
         return cached
     }
 
-    private func isCachedNotMailGPGContent(for key: String?) -> Bool {
+    /// Whether we already decided this message is not PGP content.
+    ///
+    /// Honoured only for a body of the SAME size the verdict was reached on. Mail
+    /// calls `decodedMessage` with partially downloaded bodies (large messages, or
+    /// anything that needs "Download Remaining Content"), and a truncated body sniffs
+    /// as non-PGP. Caching that verdict unconditionally made it permanent for the
+    /// session: the complete body arrived later, hit the negative cache, and the
+    /// message could never be decrypted again until a compose window opened and
+    /// closed (the only thing that called `clearUUIDCache`). A larger body re-sniffs.
+    private func isCachedNotMailGPGContent(for key: String?, size: Int) -> Bool {
         guard let key else { return false }
         cacheLock.lock()
-        let cached = uuidCache[key]?.isNotMailGPGContent ?? false
-        cacheLock.unlock()
-        return cached
+        defer { cacheLock.unlock() }
+        guard let entry = uuidCache[key], entry.isNotMailGPGContent else { return false }
+        return entry.notMailGPGSize == size
+    }
+
+    /// Insert or replace an entry and evict the oldest once over `cacheLimit`.
+    /// Caller must hold `cacheLock`.
+    private func setLocked(_ entry: UUIDCacheEntry, for key: String) {
+        if uuidCache[key] == nil { cacheOrder.append(key) }
+        uuidCache[key] = entry
+        while cacheOrder.count > Self.cacheLimit {
+            uuidCache.removeValue(forKey: cacheOrder.removeFirst())
+        }
     }
 
     private func storeCacheEntry(_ entry: UUIDCacheEntry, for key: String) {
         cacheLock.lock()
-        uuidCache[key] = entry
+        setLocked(entry, for: key)
         cacheLock.unlock()
     }
 
+    /// Store a successful decode.
+    ///
+    /// A successful decode is allowed to OVERWRITE a negative ("not MailGPG content")
+    /// entry. Mail routinely calls `decodedMessage` with a partially downloaded body
+    /// — large messages, or anything needing "Download Remaining Content" — and that
+    /// partial body sniffs as non-PGP. Before, that verdict was permanent for the
+    /// lifetime of the Mail session: the full body arrived later and hit the negative
+    /// cache, so the message could never be decrypted again until a compose window
+    /// happened to open and close. That is the "*some* mails do not decrypt" case.
+    ///
+    /// A real result is never overwritten, so the anti-re-entrancy guarantee that the
+    /// repeat-call cache exists for is unaffected.
     private func storeDecodedMessageIfNeeded(_ decoded: MEDecodedMessage, for key: String) {
         cacheLock.lock()
-        if uuidCache[key] == nil {
-            uuidCache[key] = UUIDCacheEntry(
-                encodeResult: nil,
+        if uuidCache[key]?.decodedMessage == nil {
+            setLocked(UUIDCacheEntry(
+                encodeResult: uuidCache[key]?.encodeResult,
                 decodedMessage: decoded,
-                isNotMailGPGContent: false)
+                isNotMailGPGContent: false), for: key)
         }
         cacheLock.unlock()
     }
 
-    private func storeNotMailGPGContent(for key: String?) {
+    private func storeNotMailGPGContent(for key: String?, size: Int) {
         guard let key else { return }
         cacheLock.lock()
-        if uuidCache[key] == nil {
-            uuidCache[key] = UUIDCacheEntry(
+        // Never downgrade a real result to "not ours"; do refresh the size a previous
+        // negative verdict was reached on.
+        if uuidCache[key]?.decodedMessage == nil && uuidCache[key]?.encodeResult == nil {
+            setLocked(UUIDCacheEntry(
                 encodeResult: nil,
                 decodedMessage: nil,
-                isNotMailGPGContent: true)
+                isNotMailGPGContent: true,
+                notMailGPGSize: size), for: key)
         }
         cacheLock.unlock()
     }
@@ -87,6 +141,7 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
     func clearUUIDCache() {
         cacheLock.lock()
         uuidCache.removeAll()
+        cacheOrder.removeAll()
         cacheLock.unlock()
     }
 
@@ -188,7 +243,10 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
             return
         }
 
-        let senderEmail  = message.fromAddress.rawString.lowercased()
+        // Must be the BARE address: `rawString` is the full RFC 2822 form
+        // ("Jan Hesmert <jan@example.com>"), which can never equal a KeyInfo address,
+        // so key selection silently fell through to "whatever gpg listed first".
+        let senderEmail  = message.fromAddress.bareAddress
         let state = sessionState(for: message)
         let fingerprints = state?.recipientKeys.values.map(\.fingerprint) ?? []
 
@@ -238,11 +296,19 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
                 // to the sender's own key (so the sent copy stays readable).
                 log.info("encode: fetching secret keys via XPC…")
                 let secretKeys = try await GPGService.shared.listSecretKeys()
-                let usable = secretKeys.filter { !$0.isRevoked && $0.expiresAt.map { $0 > Date() } ?? true }
-                log.info("encode: \(usable.count) usable key(s) of \(secretKeys.count) total")
+                log.info("encode: \(secretKeys.count) secret key(s) in the keyring")
 
-                let signerKey = usable.first(where: { $0.email.lowercased() == senderEmail })
-                                ?? usable.first
+                // Pick by identity: per-address pin → any-UID address match →
+                // global default → first usable. selectSigningKey also applies the
+                // revoked/expired filter, so "usable" is defined in exactly one place.
+                let signerKey = selectSigningKey(
+                    senderAddress: senderEmail,
+                    from: secretKeys,
+                    overrides: GPGService.shared.getSigningKeyOverrides(),
+                    defaultFingerprint: await GPGService.shared.getDefaultSigningKey())
+                if let signerKey {
+                    log.info("encode: selected signing key \(signerKey.keyID, privacy: .public) for sender")
+                }
 
                 // When encrypting, include the sender's key so the sent copy is
                 // decryptable. Without this, Mail's indexer calls decodedMessage on
@@ -263,20 +329,26 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
                             encryptionError: nil))
                         return
                     }
+                    // Pass the FINGERPRINT, not the 8-hex keyID: a short key ID is not
+                    // unique, so with several secret keys `--local-user AABBCCDD` can
+                    // resolve to a different key than the fingerprint we hand
+                    // `--recipient` for encrypt-to-self — a message signed by one key
+                    // and encrypted to another. (`signerKeyID:` keeps its label: it is
+                    // part of the @objc XPC selector.)
                     log.info("encode: signing with selected sender key")
 
                     if shouldEncrypt {
                         log.info("encode: sign+encrypt to \(encryptFingerprints.count) recipient(s)")
                         encodedData = MEEncodedOutgoingMessage(
                             rawData: try await GPGService.shared.signAndEncrypt(
-                                data: body, signerKeyID: signerKey.keyID,
+                                data: body, signerKeyID: signerKey.fingerprint,
                                 recipientFingerprints: encryptFingerprints),
                             isSigned: true, isEncrypted: true)
                         log.info("encode: sign+encrypt succeeded")
                     } else {
                         encodedData = MEEncodedOutgoingMessage(
                             rawData: try await GPGService.shared.sign(
-                                data: body, signerKeyID: signerKey.keyID),
+                                data: body, signerKeyID: signerKey.fingerprint),
                             isSigned: true, isEncrypted: false)
                         log.info("encode: sign succeeded")
                     }
@@ -358,9 +430,7 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
 
     /// Extract a header value from raw RFC 2822 message data (case-insensitive).
     private nonisolated static func headerValue(_ name: String, in data: Data) -> String? {
-        let eoh = data.range(of: Data("\r\n\r\n".utf8))
-               ?? data.range(of: Data("\n\n".utf8))
-        let headerData = eoh.map { Data(data[..<$0.lowerBound]) } ?? data.prefix(4096)
+        let headerData = Data(headerBlock(in: data))
         guard let headerStr = String(data: headerData, encoding: .utf8) else { return nil }
         let target = name.lowercased() + ":"
         for line in headerStr.components(separatedBy: "\n") {
@@ -411,12 +481,33 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
         return result
     }
 
+    /// Range of the blank line that ends the RFC 2822 header block.
+    ///
+    /// Must pick whichever separator comes FIRST, not CRLFCRLF by preference: with
+    /// LF headers and CRLF content in the body (routine for forwarded or re-encoded
+    /// mail) the CRLF search matches inside the *body*, so the "header block" comes
+    /// back as headers + body. One non-UTF-8 byte anywhere in that span then makes
+    /// `String(data:encoding:.utf8)` return nil, `isMIMEEncrypted` false, and the
+    /// message gets negative-cached as "not PGP" — and `headerValue` returns nil for
+    /// message-id at the same time, nulling the cache key.
+    ///
+    /// `GPGServiceImpl.splitMessage` has carried this logic (and the explanation)
+    /// for a while; these two helpers were simply never updated to match.
+    private nonisolated static func endOfHeaders(in data: Data) -> Range<Data.Index>? {
+        let crlf = data.range(of: Data("\r\n\r\n".utf8))
+        let lf   = data.range(of: Data("\n\n".utf8))
+        switch (crlf, lf) {
+        case (let c?, let l?): return c.lowerBound <= l.lowerBound ? c : l
+        case (let c?, nil):    return c
+        case (nil, let l?):    return l
+        case (nil, nil):       return nil
+        }
+    }
+
     /// Return only the RFC 2822 header block. This stays small for normal mail and
     /// avoids decoding large message bodies just to decide whether MailGPG applies.
     private nonisolated static func headerBlock(in data: Data) -> Data.SubSequence {
-        let eohRange = data.range(of: Data("\r\n\r\n".utf8))
-                    ?? data.range(of: Data("\n\n".utf8))
-        return eohRange.map { data[..<$0.lowerBound] } ?? data.prefix(4096)
+        endOfHeaders(in: data).map { data[..<$0.lowerBound] } ?? data.prefix(4096)
     }
 
     private nonisolated static func containsASCII(_ needle: Data, in data: Data) -> Bool {
@@ -434,7 +525,7 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
             log.debug("decodedMessage: cache hit (\(data.count) bytes)")
             return cached
         }
-        if isCachedNotMailGPGContent(for: cacheKey) {
+        if isCachedNotMailGPGContent(for: cacheKey, size: data.count) {
             log.debug("decodedMessage: negative cache hit (\(data.count) bytes)")
             return nil
         }
@@ -465,7 +556,7 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
 
         guard isEncrypted || isSigned else {
             log.debug("decodedMessage: not encrypted or signed — returning nil")
-            storeNotMailGPGContent(for: cacheKey)
+            storeNotMailGPGContent(for: cacheKey, size: data.count)
             return nil
         }
 
@@ -526,13 +617,31 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
                     } else {
                         banner = nil
                     }
-                    result = Self.makeDecodedMessage(data: plaintext, status: status, wasEncrypted: true, banner: banner)
+                    if case .decryptionFailed(let reason, let details) = status {
+                        // The host app now reports *why* rather than throwing an
+                        // opaque NSError, so there is something to show.
+                        log.error("decodedMessage: decrypt failed — \(reason, privacy: .public)")
+                        DecryptionFailureLog.shared.record(
+                            messageID: messageId ?? messageUUID,
+                            subject: Self.headerValue("subject", in: data).map(Self.decodeMIMEWords),
+                            reason: reason,
+                            details: details)
+                        result = Self.makeFailedDecodedMessage(reason: reason, status: status,
+                                                               original: data)
+                    } else {
+                        result = Self.makeDecodedMessage(data: plaintext, status: status, wasEncrypted: true, banner: banner)
+                    }
                 } catch let error as NSError {
                     Self.logNSError(error, prefix: "decodedMessage: decrypt error")
-                    // Return nil so Mail shows the raw message instead of crashing.
-                    // Returning a MEDecodedMessage with the original encrypted data
-                    // causes Mail's indexer to loop and trigger a KVO re-entrancy crash.
-                    result = nil
+                    let reason = error.localizedDescription
+                    DecryptionFailureLog.shared.record(
+                        messageID: messageId ?? messageUUID,
+                        subject: Self.headerValue("subject", in: data).map(Self.decodeMIMEWords),
+                        reason: reason)
+                    result = Self.makeFailedDecodedMessage(
+                        reason: reason,
+                        status: .decryptionFailed(reason: reason),
+                        original: data)
                 }
                 semaphore.signal()
             }
@@ -550,13 +659,57 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
         return result
     }
 
+    /// Build the `MEDecodedMessage` returned for a message we could not decrypt.
+    ///
+    /// The hazard this has to work around: returning an `MEDecodedMessage` whose data
+    /// is the ORIGINAL encrypted message makes Mail's indexer re-enter
+    /// `decodedMessage` for the same content, loop, and eventually hit a KVO
+    /// re-entrancy crash. That is why this path used to return `nil` — at the cost of
+    /// telling Mail "not my message" and making every failure invisible.
+    ///
+    /// Two things keep it safe here:
+    ///  • the body is explanatory text, NOT the armor echoed back, so re-decoding it
+    ///    sniffs as plain and terminates immediately;
+    ///  • the caller caches the result under `cacheKey`, so Mail's repeat calls get
+    ///    the identical object back rather than starting another decrypt.
+    private nonisolated static func makeFailedDecodedMessage(reason: String,
+                                                             status: SecurityStatus,
+                                                             original: Data) -> MEDecodedMessage? {
+        let subject = headerValue("subject", in: original).map(decodeMIMEWords) ?? ""
+        // Keep the envelope headers so Mail still shows From/To/Date/Subject, but
+        // replace the content type: the body below is plain text, not PGP.
+        var headerLines: [String] = []
+        for name in ["from", "to", "cc", "date", "message-id", "subject"] {
+            if let value = headerValue(name, in: original) {
+                headerLines.append("\(name.capitalized): \(value)")
+            }
+        }
+        headerLines.append("Content-Type: text/plain; charset=utf-8")
+        headerLines.append("Content-Transfer-Encoding: 8bit")
+
+        let body = """
+            🔒 This message is encrypted, and MailGPG could not decrypt it.
+
+            \(reason)
+
+            The original encrypted message is unchanged on the server. See             MailGPG → Diagnostics → Recent decryption failures for the full list.
+            """
+        let message = headerLines.joined(separator: "\n") + "\n\n" + body + "\n"
+        log.info("decodedMessage: returning decryptionFailed placeholder for \(subject, privacy: .private)")
+        return makeDecodedMessage(data: Data(message.utf8), status: status, wasEncrypted: true,
+                                  banner: MEDecodedMessageBanner(
+                                    title: "🔒 Could not decrypt: \(reason)",
+                                    primaryActionTitle: "Details",
+                                    dismissable: false))
+    }
+
     /// - Parameter wasEncrypted: `true` when returning decrypted plaintext,
     ///   so `MEMessageSecurityInformation.isEncrypted` is set correctly even
     ///   when the status isn't `.encrypted` (e.g. `.signed` after decrypt).
     static nonisolated func makeDecodedMessage(data: Data, status: SecurityStatus, wasEncrypted: Bool = false, banner: MEDecodedMessageBanner? = nil) -> MEDecodedMessage? {
         let meSigners: [MEMessageSigner] = {
             switch status {
-            case .signed(let signers), .encrypted(let signers):
+            case .signed(let signers), .encrypted(let signers, _):
                 return signers.map {
                     MEMessageSigner(emailAddresses: [MEEmailAddress(rawString: $0.email)], signatureLabel: $0.keyID, context: nil)
                 }
@@ -573,7 +726,7 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
             signers: meSigners,
             isEncrypted: isEncrypted,
             signingError: { if case .signatureInvalid(let r) = status { return NSError(domain: "MailGPG", code: 1, userInfo: [NSLocalizedDescriptionKey: r]) }; return nil }(),
-            encryptionError: { if case .decryptionFailed(let r) = status { return NSError(domain: "MailGPG", code: 2, userInfo: [NSLocalizedDescriptionKey: r]) }; return nil }()
+            encryptionError: { if case .decryptionFailed(let r, _) = status { return NSError(domain: "MailGPG", code: 2, userInfo: [NSLocalizedDescriptionKey: r]) }; return nil }()
         )
 
         let context = try? JSONEncoder().encode(status)

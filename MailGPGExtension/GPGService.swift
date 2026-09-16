@@ -298,6 +298,35 @@ actor GPGService {
         Self.defaults?.set(fingerprint, forKey: "defaultSigningKeyFingerprint")
     }
 
+    // MARK: - Per-address signing key overrides (UserDefaults, no XPC needed)
+
+    /// Pins a specific secret key to a specific From address.
+    ///
+    /// Auto-matching by address is ambiguous whenever an identity has more than one
+    /// currently-valid key (an RSA and an ECC key on the same address is a common
+    /// setup), so an explicit per-identity pin is required, not merely nice to have.
+    /// Selection happens entirely extension-side in `selectSigningKey`, so this needs
+    /// no XPC method — just the shared app-group suite, same as the keyserver list.
+    ///
+    /// Keys are bare lowercased addresses; values are uppercase 40-char fingerprints.
+    /// `nonisolated` because both the encode path and the SwiftUI pickers read it
+    /// synchronously.
+    nonisolated func getSigningKeyOverrides() -> [String: String] {
+        Self.defaults?.dictionary(forKey: "signingKeyOverrides") as? [String: String] ?? [:]
+    }
+
+    /// Pin `address` to `fingerprint`, or clear the pin when `fingerprint` is `nil`.
+    nonisolated func setSigningKeyOverride(address: String, fingerprint: String?) {
+        var overrides = getSigningKeyOverrides()
+        let key = address.lowercased()
+        if let fingerprint {
+            overrides[key] = fingerprint.uppercased()
+        } else {
+            overrides.removeValue(forKey: key)
+        }
+        Self.defaults?.set(overrides, forKey: "signingKeyOverrides")
+    }
+
     // MARK: - Keyservers (UserDefaults, no XPC needed)
 
     static let defaultKeyservers = [
