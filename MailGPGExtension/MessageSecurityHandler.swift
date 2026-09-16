@@ -248,7 +248,9 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
         // so key selection silently fell through to "whatever gpg listed first".
         let senderEmail  = message.fromAddress.bareAddress
         let state = sessionState(for: message)
-        let fingerprints = state?.recipientKeys.values.map(\.fingerprint) ?? []
+        // Every key of every recipient — a correspondent with two published keys gets
+        // a PKESK packet for each, because we cannot know which one they can use.
+        let fingerprints = state?.recipientKeys.values.flatMap { $0 }.map(\.fingerprint) ?? []
 
         // Check if encryption is requested but some recipients are missing keys.
         if shouldEncrypt {
@@ -319,6 +321,11 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
                     encryptFingerprints.append(sk.fingerprint)
                     log.info("encode: added sender key to encryption recipients")
                 }
+                // De-duplicate: a recipient reachable under two of their addresses, or
+                // a reply-all that includes ourselves, would otherwise pass the same
+                // --recipient twice.
+                var seenFingerprints = Set<String>()
+                encryptFingerprints = encryptFingerprints.filter { seenFingerprints.insert($0).inserted }
 
                 if shouldSign {
                     guard let signerKey else {

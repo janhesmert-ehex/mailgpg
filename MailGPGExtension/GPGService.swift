@@ -2,6 +2,9 @@
 // MailGPGExtension (extension only)
 
 import Foundation
+import os
+
+private let log = Logger(subsystem: "com.mahaupt.mailgpg", category: "xpc")
 
 // MARK: - HostAppReachability
 
@@ -211,6 +214,33 @@ actor GPGService {
                     continuation.resume(throwing: error)
                 }
             }
+        }
+    }
+
+    /// All usable public keys for `email`, so a correspondent who publishes more than
+    /// one key gets a PKESK packet for each — you cannot know which one they can
+    /// actually decrypt with.
+    ///
+    /// Falls back to the single-key `lookupKey` when the host app is older than this
+    /// extension: an unimplemented selector surfaces through
+    /// `remoteObjectProxyWithErrorHandler` as NSCocoaErrorDomain 4099.
+    func lookupKeys(email: String) async throws -> [KeyInfo] {
+        let proxy = try connection.proxy()
+        do {
+            return try await withCheckedThrowingContinuation { continuation in
+                proxy.lookupKeys(email: email) { keyListJSON, error in
+                    if let error { continuation.resume(throwing: error); return }
+                    // nil data with no error means no key exists for this address.
+                    guard let keyListJSON else {
+                        continuation.resume(returning: [])
+                        return
+                    }
+                    continuation.resume(with: keyListJSON, as: [KeyInfo].self)
+                }
+            }
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == 4099 {
+            log.info("lookupKeys unavailable on the host app — falling back to lookupKey")
+            return try await lookupKey(email: email).map { [$0] } ?? []
         }
     }
 

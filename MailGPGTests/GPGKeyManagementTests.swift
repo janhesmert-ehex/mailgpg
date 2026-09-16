@@ -85,6 +85,37 @@ final class GPGKeyManagementTests: XCTestCase {
         XCTAssertFalse(k.contains(where: \.hasSecretKey))
     }
 
+    // MARK: - Multi-key lookup
+
+    func testResolveKeysReturnsEveryKeyForTheAddress() throws {
+        // Both fixture keys share one address — a recipient with an RSA and an ECC key.
+        let keys = try svc.resolveKeys(email: homedir.email)
+        XCTAssertEqual(Set(keys.map(\.fingerprint)),
+                       [homedir.fingerprint, homedir.secondFingerprint],
+                       "Encrypting to only one of a recipient's keys can leave them unable to read it")
+    }
+
+    func testResolveKeysFiltersSubstringMatches() throws {
+        // gpg's key search matches a substring anywhere in the UID, so a search term
+        // that is not a complete address still comes back with keys. Without the
+        // re-filter on normalizedEmails those keys become --recipient arguments —
+        // i.e. strangers silently added as recipients of an encrypted message.
+        let (raw, _, code) = try homedir.run(
+            ["--list-keys", "--with-colons", "--fixed-list-mode", "example.com"])
+        XCTAssertEqual(code, 0)
+        let matched = svc.parseColonOutput(String(data: raw, encoding: .utf8) ?? "",
+                                           wantSecretKeys: false)
+        XCTAssertFalse(matched.isEmpty, "Expected gpg to substring-match both fixture keys")
+
+        XCTAssertTrue(try svc.resolveKeys(email: "example.com").isEmpty,
+                      "A substring match is not an address match")
+    }
+
+    func testResolveKeysReturnsEmptyForUnknownAddress() throws {
+        // No keyservers configured in the test environment, so this stays local.
+        XCTAssertTrue(try svc.resolveKeys(email: "nobody@nowhere.invalid").isEmpty)
+    }
+
     // MARK: - Import / Export
 
     func testImportExportedPublicKey() throws {
