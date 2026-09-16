@@ -633,8 +633,10 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
                             subject: Self.headerValue("subject", in: data).map(Self.decodeMIMEWords),
                             reason: reason,
                             details: details)
-                        result = Self.makeFailedDecodedMessage(reason: reason, status: status,
-                                                               original: data)
+                        result = isMIMEEncrypted
+                            ? Self.makeFailedDecodedMessage(reason: reason, status: status,
+                                                            original: data)
+                            : nil
                     } else {
                         result = Self.makeDecodedMessage(data: plaintext, status: status, wasEncrypted: true, banner: banner)
                     }
@@ -645,10 +647,12 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
                         messageID: messageId ?? messageUUID,
                         subject: Self.headerValue("subject", in: data).map(Self.decodeMIMEWords),
                         reason: reason)
-                    result = Self.makeFailedDecodedMessage(
-                        reason: reason,
-                        status: .decryptionFailed(reason: reason),
-                        original: data)
+                    result = isMIMEEncrypted
+                        ? Self.makeFailedDecodedMessage(
+                            reason: reason,
+                            status: .decryptionFailed(reason: reason),
+                            original: data)
+                        : nil
                 }
                 semaphore.signal()
             }
@@ -667,6 +671,13 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
     }
 
     /// Build the `MEDecodedMessage` returned for a message we could not decrypt.
+    ///
+    /// Only used when the message is *certainly* encrypted — a `multipart/encrypted`
+    /// part with `application/pgp-encrypted`. The inline-PGP sniff is a byte scan for
+    /// the armor marker anywhere in the message, so a plaintext mail that merely
+    /// QUOTES an armor block matches it; replacing such a message with an error
+    /// placeholder would be worse than the silence this replaces. Those failures are
+    /// still recorded in `DecryptionFailureLog`, and the caller returns nil for them.
     ///
     /// The hazard this has to work around: returning an `MEDecodedMessage` whose data
     /// is the ORIGINAL encrypted message makes Mail's indexer re-enter
