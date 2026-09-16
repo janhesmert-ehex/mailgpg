@@ -583,4 +583,108 @@ final class ParsingTests: XCTestCase {
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         )
     }
+
+    // MARK: - sniffPGPContent / PGP "partitioned" mail (gpg4o, PGP Desktop)
+
+    private static let fakeArmor = """
+        -----BEGIN PGP MESSAGE-----
+        Comment: Using gpg4o v6.0.124.9651
+
+        hF4D6SBd26gA4IgSAQdALaMhy+ZjYJ4dGKhVnBCNlLnktjxHoplXEt4PAnlDVicw
+        wcDMA1x2yr2CjS4cAQwAiKgtcMdMCUBVyDCcYYb2AbBUnLPGZXY0AJq0R59nZBkr
+        =NhIh
+        -----END PGP MESSAGE-----
+        """
+
+    /// A redacted copy of the structure gpg4o (Outlook) produces: NOT RFC 3156 —
+    /// a plain multipart/mixed whose text part is the ASCII armor hidden under
+    /// Content-Transfer-Encoding: base64, plus an encrypted-HTML attachment.
+    private static func partitionedMessage(armor: String = fakeArmor) -> Data {
+        let armorB64 = Data(armor.utf8)
+            .base64EncodedString(options: [.lineLength76Characters, .endLineWithCarriageReturn])
+        let message = """
+            From: sender@example.com\r
+            To: recipient@example.com\r
+            Subject: Abstimmung Termine\r
+            Message-ID: <redacted@example.com>\r
+            Content-Type: multipart/mixed; boundary="_002_boundary_"\r
+            MIME-Version: 1.0\r
+            \r
+            --_002_boundary_\r
+            Content-Type: text/plain; charset=UTF-8\r
+            Content-Transfer-Encoding: base64\r
+            \r
+            \(armorB64)\r
+            \r
+            --_002_boundary_\r
+            Content-Type: application/octet-stream; name="PGPexch.htm.pgp"\r
+            Content-Disposition: attachment; filename="PGPexch.htm.pgp"\r
+            Content-Transfer-Encoding: base64\r
+            \r
+            \(armorB64)\r
+            \r
+            --_002_boundary_--\r
+            """
+        return Data(message.utf8)
+    }
+
+    private func lowercasedHeaderBlock(of data: Data) -> String {
+        let (headers, _) = svc.splitMessage(data)
+        return headers.lowercased()
+    }
+
+    func testSniff_partitionedBase64Armor_detectedAsEncrypted() {
+        let data = Self.partitionedMessage()
+        let sniff = sniffPGPContent(lowercasedHeaderBlock: lowercasedHeaderBlock(of: data),
+                                    rawMessage: data)
+        XCTAssertTrue(sniff.isInlinePGP, "base64-encoded armor must sniff as inline PGP")
+        XCTAssertTrue(sniff.isEncrypted)
+        XCTAssertFalse(sniff.isMIMEEncrypted, "partitioned mail is multipart/mixed, not RFC 3156")
+        XCTAssertFalse(sniff.isSigned)
+    }
+
+    func testSniff_literalInlineArmor_detectedAsEncrypted() {
+        let data = Data("""
+            From: sender@example.com\r
+            Content-Type: text/plain\r
+            \r
+            \(Self.fakeArmor)\r
+            """.utf8)
+        let sniff = sniffPGPContent(lowercasedHeaderBlock: lowercasedHeaderBlock(of: data),
+                                    rawMessage: data)
+        XCTAssertTrue(sniff.isInlinePGP)
+        XCTAssertTrue(sniff.isEncrypted)
+    }
+
+    func testSniff_rfc3156_detectedAsMIMEEncrypted() {
+        let armored = Data(Self.fakeArmor.utf8)
+        let data = svc.buildEncryptedMessage(
+            original: Data("From: a@b.c\nSubject: x\nContent-Type: text/plain\n\nhello".utf8),
+            encrypted: armored)
+        let sniff = sniffPGPContent(lowercasedHeaderBlock: lowercasedHeaderBlock(of: data),
+                                    rawMessage: data)
+        XCTAssertTrue(sniff.isMIMEEncrypted)
+        XCTAssertTrue(sniff.isEncrypted)
+    }
+
+    func testSniff_plainMail_notDetected() {
+        let data = Data("""
+            From: sender@example.com\r
+            Content-Type: text/plain\r
+            \r
+            Just a normal message. Nothing to see here.\r
+            """.utf8)
+        let sniff = sniffPGPContent(lowercasedHeaderBlock: lowercasedHeaderBlock(of: data),
+                                    rawMessage: data)
+        XCTAssertFalse(sniff.isEncrypted)
+        XCTAssertFalse(sniff.isSigned)
+    }
+
+    func testExtractPGPPayload_partitionedBase64Armor_returnsArmor() {
+        let payload = svc.extractPGPPayload(from: Self.partitionedMessage())
+        let str = String(data: payload, encoding: .utf8) ?? ""
+        XCTAssertTrue(str.hasPrefix("-----BEGIN PGP MESSAGE-----"),
+                      "extraction must decode the base64 CTE and return the armor")
+        XCTAssertTrue(str.hasSuffix("-----END PGP MESSAGE-----"))
+    }
 }

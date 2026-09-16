@@ -1,6 +1,8 @@
 // SecurityStatus.swift
 // MailGPGExtension
 
+import Foundation
+
 /// A single PGP signer attached to a message.
 struct Signer: Equatable, Codable {
     /// The email address associated with the signing key.
@@ -135,4 +137,56 @@ enum SecurityStatus: Equatable, Codable {
                 debugDescription: "Unrecognised SecurityStatus case"))
         }
     }
+}
+
+// MARK: - PGP content sniff
+
+/// Result of the cheap byte-level scan that decides whether a raw RFC 2822 message
+/// is worth handing to GPG at all. Shared so the extension's decode path and the
+/// unit tests classify messages with exactly the same logic.
+struct PGPContentSniff {
+    /// `multipart/encrypted` + `application/pgp-encrypted` in the header block (RFC 3156).
+    let isMIMEEncrypted: Bool
+    /// `multipart/signed` + `application/pgp-signature` in the header block (RFC 3156).
+    let isMIMESigned: Bool
+    /// An armored PGP MESSAGE block anywhere in the body — literal or base64-encoded.
+    let isInlinePGP: Bool
+    /// An armored PGP SIGNED MESSAGE block anywhere in the body.
+    let isInlineSigned: Bool
+
+    var isEncrypted: Bool { isMIMEEncrypted || isInlinePGP }
+    var isSigned: Bool { isMIMESigned || isInlineSigned }
+}
+
+/// Classify a raw message as PGP-encrypted / PGP-signed / neither.
+///
+/// - Parameters:
+///   - lowercasedHeaderBlock: the message's RFC 2822 header block, lowercased.
+///     Passed in (rather than derived here) so the caller keeps sole ownership of
+///     the header/body split logic.
+///   - rawMessage: the complete raw message, scanned as bytes so large bodies
+///     never pay for a String conversion.
+///
+/// Besides the literal armor markers, this also scans for the base64 encoding of
+/// `-----BEGIN PGP MESSAGE-----`. PGP "partitioned" mail (gpg4o, PGP Desktop and
+/// other Outlook/Exchange gateways) is a plain `multipart/mixed` whose text part
+/// carries the armor under `Content-Transfer-Encoding: base64` — the literal
+/// marker never appears in the raw bytes, so such mail used to sniff as "not PGP"
+/// and was never offered to GPG at all. The armor header is 27 bytes — a whole
+/// number of base64 triples — so its 36-char encoding is exact and independent of
+/// the bytes that follow; and since the armor starts the part (offset 0 in the
+/// base64 stream), the 76-column line wrapping cannot split it.
+func sniffPGPContent(lowercasedHeaderBlock preview: String, rawMessage data: Data) -> PGPContentSniff {
+    let inlineMessageMarker = Data("-----BEGIN PGP MESSAGE-----".utf8)
+    let inlineSignedMarker  = Data("-----BEGIN PGP SIGNED MESSAGE-----".utf8)
+    let base64MessageMarker = Data("LS0tLS1CRUdJTiBQR1AgTUVTU0FHRS0tLS0t".utf8)
+
+    return PGPContentSniff(
+        isMIMEEncrypted: preview.contains("multipart/encrypted")
+                      && preview.contains("application/pgp-encrypted"),
+        isMIMESigned: preview.contains("multipart/signed")
+                   && preview.contains("application/pgp-signature"),
+        isInlinePGP: data.range(of: inlineMessageMarker) != nil
+                  || data.range(of: base64MessageMarker) != nil,
+        isInlineSigned: data.range(of: inlineSignedMarker) != nil)
 }

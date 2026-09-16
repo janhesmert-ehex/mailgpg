@@ -48,9 +48,6 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
         }
     }
 
-    private nonisolated static let inlinePGPMessageMarker = Data("-----BEGIN PGP MESSAGE-----".utf8)
-    private nonisolated static let inlinePGPSignedMarker = Data("-----BEGIN PGP SIGNED MESSAGE-----".utf8)
-
     private func cachedEncodeResult(for key: String?) -> MEMessageEncodingResult? {
         guard let key else { return nil }
         cacheLock.lock()
@@ -517,10 +514,6 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
         endOfHeaders(in: data).map { data[..<$0.lowerBound] } ?? data.prefix(4096)
     }
 
-    private nonisolated static func containsASCII(_ needle: Data, in data: Data) -> Bool {
-        data.range(of: needle) != nil
-    }
-
     func decodedMessage(forMessageData data: Data) -> MEDecodedMessage? {
         // Cache lookup: try UUID first (for messages we just encoded), then
         // Message-Id (for incoming messages from the server).
@@ -547,17 +540,13 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
         // push Content-Type well past 4 KB.
         let headerData = Data(Self.headerBlock(in: data))
         let preview = (String(data: headerData, encoding: .utf8) ?? "").lowercased()
-        // For inline PGP (e.g. Mailvelope), the PGP block is in the body, not the headers.
-        // Check for ASCII armor markers as bytes so normal large messages do not
-        // pay the cost of converting the whole body to a Swift String.
-        let isMIMEEncrypted = preview.contains("multipart/encrypted")
-                           && preview.contains("application/pgp-encrypted")
-        let isMIMESigned    = preview.contains("multipart/signed")
-                           && preview.contains("application/pgp-signature")
-        let isInlinePGP     = Self.containsASCII(Self.inlinePGPMessageMarker, in: data)
-        let isInlineSigned  = Self.containsASCII(Self.inlinePGPSignedMarker, in: data)
-        let isEncrypted = isMIMEEncrypted || isInlinePGP
-        let isSigned    = isMIMESigned    || isInlineSigned
+        // Classification lives in Shared/SecurityStatus.swift (sniffPGPContent) so it
+        // is unit-testable; it also covers base64-encoded armor (gpg4o / PGP Desktop
+        // "partitioned" mail), which the old literal byte scan missed.
+        let sniff = sniffPGPContent(lowercasedHeaderBlock: preview, rawMessage: data)
+        let isMIMEEncrypted = sniff.isMIMEEncrypted
+        let isEncrypted = sniff.isEncrypted
+        let isSigned    = sniff.isSigned
 
         log.debug("decodedMessage: \(data.count) bytes — encrypted=\(isEncrypted) signed=\(isSigned)")
 
