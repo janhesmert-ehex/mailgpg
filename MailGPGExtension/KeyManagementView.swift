@@ -203,7 +203,9 @@ private struct PublicKeysTab: View {
         if searchText.isEmpty { return keys }
         let q = searchText.lowercased()
         return keys.filter {
-            $0.email.lowercased().contains(q) ||
+            // Search every UID address, not just the primary one — otherwise a key
+            // filed under a second address cannot be found by that address.
+            $0.normalizedEmails.contains(where: { $0.contains(q) }) ||
             $0.name.lowercased().contains(q)
         }
     }
@@ -257,7 +259,7 @@ private struct PublicKeyRow: View {
                 Spacer()
                 TrustLevelBadge(level: key.validity)
             }
-            Text(key.email)
+            Text(key.normalizedEmails.joined(separator: ", "))
                 .font(.caption)
                 .foregroundStyle(.secondary)
             HStack(spacing: 4) {

@@ -703,9 +703,14 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
             """
         let message = headerLines.joined(separator: "\n") + "\n\n" + body + "\n"
         log.info("decodedMessage: returning decryptionFailed placeholder for \(subject, privacy: .private)")
+        // The reason can be raw gpg stderr, which is multi-line — keep the banner to
+        // one readable line and leave the full text to the body and the Details panel.
+        let headline = reason.components(separatedBy: .newlines)
+            .first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) ?? reason
+        let title = headline.count > 120 ? String(headline.prefix(117)) + "…" : headline
         return makeDecodedMessage(data: Data(message.utf8), status: status, wasEncrypted: true,
                                   banner: MEDecodedMessageBanner(
-                                    title: "🔒 Could not decrypt: \(reason)",
+                                    title: "🔒 Could not decrypt: \(title)",
                                     primaryActionTitle: "Details",
                                     dismissable: false))
     }
