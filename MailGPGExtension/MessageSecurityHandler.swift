@@ -497,9 +497,20 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
     ///
     /// `GPGServiceImpl.splitMessage` has carried this logic (and the explanation)
     /// for a while; these two helpers were simply never updated to match.
+    /// Headers can grow past 4 KB (DKIM, ARC, Received, …) but never anywhere
+    /// near this. Bounding the search matters for responsiveness: a pure-CRLF
+    /// message contains no "\n\n" at all, so an unbounded search scanned the
+    /// ENTIRE body on every call — and this runs several times per displayed
+    /// message (cache-key lookup, subject extraction), for every message, PGP
+    /// or not.
+    private nonisolated static let headerSearchLimit = 256 * 1024
+
     private nonisolated static func endOfHeaders(in data: Data) -> Range<Data.Index>? {
-        let crlf = data.range(of: Data("\r\n\r\n".utf8))
-        let lf   = data.range(of: Data("\n\n".utf8))
+        // Data slices share their parent's indices, so ranges found in the
+        // bounded window are valid indices into `data`.
+        let window = data.prefix(Self.headerSearchLimit)
+        let crlf = window.range(of: Data("\r\n\r\n".utf8))
+        let lf   = window.range(of: Data("\n\n".utf8))
         switch (crlf, lf) {
         case (let c?, let l?): return c.lowerBound <= l.lowerBound ? c : l
         case (let c?, nil):    return c
@@ -515,6 +526,11 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
     }
 
     func decodedMessage(forMessageData data: Data) -> MEDecodedMessage? {
+        let started = DispatchTime.now()
+        func elapsedMs() -> Double {
+            Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000
+        }
+
         // Cache lookup: try UUID first (for messages we just encoded), then
         // Message-Id (for incoming messages from the server).
         let messageUUID = Self.headerValue("x-universally-unique-identifier", in: data)
@@ -522,11 +538,11 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
         let cacheKey = messageUUID ?? messageId
 
         if let cached = cachedDecodedMessage(for: cacheKey) {
-            log.debug("decodedMessage: cache hit (\(data.count) bytes)")
+            log.debug("decodedMessage: cache hit after \(elapsedMs(), format: .fixed(precision: 1)) ms (\(data.count) bytes)")
             return cached
         }
         if isCachedNotMailGPGContent(for: cacheKey, size: data.count) {
-            log.debug("decodedMessage: negative cache hit (\(data.count) bytes)")
+            log.debug("decodedMessage: negative cache hit after \(elapsedMs(), format: .fixed(precision: 1)) ms (\(data.count) bytes)")
             return nil
         }
 
@@ -551,7 +567,7 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
         log.debug("decodedMessage: \(data.count) bytes — encrypted=\(isEncrypted) signed=\(isSigned)")
 
         guard isEncrypted || isSigned else {
-            log.debug("decodedMessage: not encrypted or signed — returning nil")
+            log.debug("decodedMessage: not encrypted or signed — returning nil after \(elapsedMs(), format: .fixed(precision: 1)) ms (\(data.count) bytes)")
             storeNotMailGPGContent(for: cacheKey, size: data.count)
             return nil
         }
@@ -560,7 +576,11 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
         // We bridge with a DispatchSemaphore: a detached Task does the async work on its
         // own thread, signals when done, and the calling thread waits.
         // Using Task.detached avoids blocking a thread the cooperative executor might need.
-        var result: MEDecodedMessage? = nil
+        //
+        // The result travels through a lock-protected box, not a captured var: the
+        // wait below has a timeout, so the task may complete AFTER the caller has
+        // already given up — writing a plain var then would race with the read.
+        let box = DecodeResultBox()
         let semaphore = DispatchSemaphore(value: 0)
 
         if isSigned && !isEncrypted {
@@ -577,16 +597,16 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
                     log.debug("decodedMessage: verifying signature (\(signedData.count) data bytes, \(signatureData.count) sig bytes)")
                     let status = try await GPGService.shared.verify(data: signedData, signature: signatureData)
                     log.debug("decodedMessage: verify completed")
-                    result = Self.makeDecodedMessage(data: data, status: status)
+                    box.set(Self.makeDecodedMessage(data: data, status: status))
                 } catch let error as NSError {
                     Self.logNSError(error, prefix: "decodedMessage: verify error")
                     switch GPGXPCError(nsError: error) {
                     case .gpgFailed:
-                        result = Self.makeDecodedMessage(
+                        box.set(Self.makeDecodedMessage(
                             data: data,
-                            status: .signatureInvalid(reason: error.localizedDescription))
+                            status: .signatureInvalid(reason: error.localizedDescription)))
                     default:
-                        result = nil
+                        box.set(nil)
                     }
                 }
                 semaphore.signal()
@@ -622,12 +642,12 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
                             subject: Self.headerValue("subject", in: data).map(Self.decodeMIMEWords),
                             reason: reason,
                             details: details)
-                        result = isMIMEEncrypted
+                        box.set(isMIMEEncrypted
                             ? Self.makeFailedDecodedMessage(reason: reason, status: status,
                                                             original: data)
-                            : nil
+                            : nil)
                     } else {
-                        result = Self.makeDecodedMessage(data: plaintext, status: status, wasEncrypted: true, banner: banner)
+                        box.set(Self.makeDecodedMessage(data: plaintext, status: status, wasEncrypted: true, banner: banner))
                     }
                 } catch let error as NSError {
                     Self.logNSError(error, prefix: "decodedMessage: decrypt error")
@@ -636,18 +656,32 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
                         messageID: messageId ?? messageUUID,
                         subject: Self.headerValue("subject", in: data).map(Self.decodeMIMEWords),
                         reason: reason)
-                    result = isMIMEEncrypted
+                    box.set(isMIMEEncrypted
                         ? Self.makeFailedDecodedMessage(
                             reason: reason,
                             status: .decryptionFailed(reason: reason),
                             original: data)
-                        : nil
+                        : nil)
                 }
                 semaphore.signal()
             }
         }
 
-        semaphore.wait()
+        // Bounded wait: an operation that never completes (a wedged XPC call, gpg
+        // stuck on a pinentry that cannot be shown, …) must not block forever —
+        // Mail serializes decode requests to the extension, so one permanently
+        // blocked call here makes EVERY message spin, PGP or not. On timeout,
+        // return nil (Mail shows the raw message) without negative-caching, so the
+        // next look at the message simply tries again.
+        if semaphore.wait(timeout: .now() + Self.decodeTimeout) == .timedOut {
+            log.error("decodedMessage: timed out after \(Int(Self.decodeTimeout))s — returning nil uncached")
+            DecryptionFailureLog.shared.record(
+                messageID: messageId ?? messageUUID,
+                subject: Self.headerValue("subject", in: data).map(Self.decodeMIMEWords),
+                reason: "Timed out after \(Int(Self.decodeTimeout))s waiting for the host app / GPG")
+            return nil
+        }
+        let result = box.value
 
         // Cache the decoded result so subsequent calls (Mail's indexer often
         // calls decodedMessage 10+ times for the same message) return instantly.
@@ -657,6 +691,22 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
         }
 
         return result
+    }
+
+    /// How long `decodedMessage` waits for the async GPG work before giving up.
+    /// Generous on purpose: a legitimate pinentry passphrase prompt happens inside
+    /// this window. It exists only so a truly stuck operation cannot wedge Mail's
+    /// decode pipeline permanently.
+    private static let decodeTimeout: TimeInterval = 60
+
+    /// Lock-protected one-shot handoff from the detached decode task to the
+    /// synchronous `decodedMessage` caller. A plain captured var would race once
+    /// the wait can time out: the task may write after the caller has moved on.
+    private final class DecodeResultBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: MEDecodedMessage?
+        func set(_ value: MEDecodedMessage?) { lock.lock(); stored = value; lock.unlock() }
+        var value: MEDecodedMessage? { lock.lock(); defer { lock.unlock() }; return stored }
     }
 
     /// Build the `MEDecodedMessage` returned for a message we could not decrypt.

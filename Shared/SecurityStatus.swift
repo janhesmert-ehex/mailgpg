@@ -177,15 +177,28 @@ struct PGPContentSniff {
 /// the bytes that follow; and since the armor starts the part (offset 0 in the
 /// base64 stream), the 76-column line wrapping cannot split it.
 func sniffPGPContent(lowercasedHeaderBlock preview: String, rawMessage data: Data) -> PGPContentSniff {
+    let isMIMEEncrypted = preview.contains("multipart/encrypted")
+                       && preview.contains("application/pgp-encrypted")
+    let isMIMESigned = preview.contains("multipart/signed")
+                    && preview.contains("application/pgp-signature")
+
+    // When the header block already classifies the message (RFC 3156 either way),
+    // the body is never scanned: the MIME verdict decides the decode path
+    // regardless of what an inline scan could add. The body scans below only run
+    // when the headers say nothing — which includes all ordinary non-PGP mail, so
+    // they stay cheap byte searches (no String conversion of the body).
+    if isMIMEEncrypted || isMIMESigned {
+        return PGPContentSniff(isMIMEEncrypted: isMIMEEncrypted, isMIMESigned: isMIMESigned,
+                               isInlinePGP: false, isInlineSigned: false)
+    }
+
     let inlineMessageMarker = Data("-----BEGIN PGP MESSAGE-----".utf8)
     let inlineSignedMarker  = Data("-----BEGIN PGP SIGNED MESSAGE-----".utf8)
     let base64MessageMarker = Data("LS0tLS1CRUdJTiBQR1AgTUVTU0FHRS0tLS0t".utf8)
 
     return PGPContentSniff(
-        isMIMEEncrypted: preview.contains("multipart/encrypted")
-                      && preview.contains("application/pgp-encrypted"),
-        isMIMESigned: preview.contains("multipart/signed")
-                   && preview.contains("application/pgp-signature"),
+        isMIMEEncrypted: false,
+        isMIMESigned: false,
         isInlinePGP: data.range(of: inlineMessageMarker) != nil
                   || data.range(of: base64MessageMarker) != nil,
         isInlineSigned: data.range(of: inlineSignedMarker) != nil)
