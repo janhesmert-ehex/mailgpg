@@ -680,6 +680,70 @@ final class ParsingTests: XCTestCase {
         XCTAssertFalse(sniff.isSigned)
     }
 
+    // MARK: - Transient decryption failures (agent died / pinentry dismissed)
+
+    func testParseDecryptStatus_pinentryCancelledIsTransient() {
+        // 0x05000063 = source gpg-agent, code 99 (GPG_ERR_CANCELED)
+        let stderr = """
+            [GNUPG:] ENC_TO AABBCCDD11223344 1 0
+            [GNUPG:] ERROR pkdecrypt_failed 83886179
+            [GNUPG:] DECRYPTION_FAILED
+            [GNUPG:] FAILURE decrypt 83886179
+            """
+        guard case .decryptionFailed(_, let details) = svc.parseDecryptStatus(stderr: stderr) else {
+            return XCTFail("expected .decryptionFailed")
+        }
+        XCTAssertEqual(details.transient, true)
+    }
+
+    func testParseDecryptStatus_agentEOFIsTransient() {
+        // 0x0500_3FFF = source gpg-agent, code 16383 (GPG_ERR_EOF): agent killed mid-op
+        let stderr = """
+            [GNUPG:] ENC_TO AABBCCDD11223344 1 0
+            [GNUPG:] DECRYPTION_FAILED
+            [GNUPG:] FAILURE decrypt \(UInt32(5 << 24 | 16383))
+            """
+        guard case .decryptionFailed(_, let details) = svc.parseDecryptStatus(stderr: stderr) else {
+            return XCTFail("expected .decryptionFailed")
+        }
+        XCTAssertEqual(details.transient, true)
+    }
+
+    func testParseDecryptStatus_missingSecretKeyIsNotTransient() {
+        let stderr = """
+            [GNUPG:] ENC_TO AABBCCDD11223344 1 0
+            [GNUPG:] NO_SECKEY AABBCCDD11223344
+            [GNUPG:] DECRYPTION_FAILED
+            [GNUPG:] FAILURE decrypt \(UInt32(5 << 24 | 17))
+            """
+        guard case .decryptionFailed(_, let details) = svc.parseDecryptStatus(stderr: stderr) else {
+            return XCTFail("expected .decryptionFailed")
+        }
+        XCTAssertNotEqual(details.transient, true)
+        XCTAssertEqual(details.missingSecretKeyIDs, ["AABBCCDD11223344"])
+    }
+
+    func testParseDecryptStatus_failureWithoutCodeIsNotTransient() {
+        let stderr = "[GNUPG:] DECRYPTION_FAILED"
+        guard case .decryptionFailed(_, let details) = svc.parseDecryptStatus(stderr: stderr) else {
+            return XCTFail("expected .decryptionFailed")
+        }
+        XCTAssertNotEqual(details.transient, true)
+    }
+
+    func testDecryptionDetails_transientRoundTripsAndDefaultsNil() throws {
+        // Wire compatibility: payloads from a host app without the field decode
+        // to nil; payloads with it round-trip.
+        let old = try JSONDecoder().decode(DecryptionDetails.self,
+            from: Data(#"{"encryptedToKeyIDs":["AA"]}"#.utf8))
+        XCTAssertNil(old.transient)
+
+        let details = DecryptionDetails(encryptedToKeyIDs: ["AA"], transient: true)
+        let decoded = try JSONDecoder().decode(DecryptionDetails.self,
+            from: JSONEncoder().encode(details))
+        XCTAssertEqual(decoded.transient, true)
+    }
+
     func testExtractPGPPayload_partitionedBase64Armor_returnsArmor() {
         let payload = svc.extractPGPPayload(from: Self.partitionedMessage())
         let str = String(data: payload, encoding: .utf8) ?? ""

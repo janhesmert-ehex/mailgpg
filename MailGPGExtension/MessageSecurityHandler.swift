@@ -152,6 +152,11 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
     func getEncodingStatus(for message: MEMessage, composeContext: MEComposeContext, completionHandler: @escaping (MEOutgoingMessageEncodingStatus) -> Void) {
         // If we already know whether the host app is reachable, respond immediately.
         if let available = HostAppReachability.shared.isAvailable {
+            // A "not running" verdict must not be sticky: the host can come back
+            // at any moment (relaunch, login item), and when we short-circuit here
+            // nothing else on this path ever touches XPC again. Answer with the
+            // cached verdict but clear it, so the NEXT status request re-pings.
+            if !available { HostAppReachability.shared.isAvailable = nil }
             completionHandler(Self.encodingStatus(hostAvailable: available))
             return
         }
@@ -634,18 +639,47 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
                         banner = nil
                     }
                     if case .decryptionFailed(let reason, let details) = status {
-                        // The host app now reports *why* rather than throwing an
-                        // opaque NSError, so there is something to show.
-                        log.error("decodedMessage: decrypt failed — \(reason, privacy: .public)")
-                        DecryptionFailureLog.shared.record(
-                            messageID: messageId ?? messageUUID,
-                            subject: Self.headerValue("subject", in: data).map(Self.decodeMIMEWords),
-                            reason: reason,
-                            details: details)
-                        box.set(isMIMEEncrypted
-                            ? Self.makeFailedDecodedMessage(reason: reason, status: status,
-                                                            original: data)
-                            : nil)
+                        // gpg NODATA on a message whose HEADERS promise
+                        // multipart/encrypted means the encrypted body part was not
+                        // in the bytes we got — Mail routinely calls decodedMessage
+                        // with partially downloaded bodies. The failure is
+                        // transient, and the error placeholder is a cached-forever
+                        // "real result", so returning it here would shadow the
+                        // successful decrypt once the full body arrives. Instead:
+                        // negative-cache THIS size (a larger body re-evaluates,
+                        // same mechanism as the non-PGP sniff) and tell Mail
+                        // "not my message" for now.
+                        // Two flavors of transient failure, same treatment:
+                        //  • NODATA — the encrypted part wasn't in the bytes Mail
+                        //    gave us (partially downloaded body)
+                        //  • details.transient — the host classified the gpg error
+                        //    as retryable (agent killed mid-op by GPG Suite's
+                        //    shutdown-gpg-agent, pinentry dismissed)
+                        if reason.contains("NODATA") || details.transient == true {
+                            log.info("decodedMessage: transient decrypt failure (\(data.count) bytes) — will retry")
+                            let note = reason.contains("NODATA")
+                                ? "\n(Encrypted part missing — body probably not fully downloaded. Retries automatically once Mail has the complete message.)"
+                                : "\n(Transient failure — GPG agent unavailable or prompt dismissed. Will be retried later, at the latest after Mail restarts.)"
+                            DecryptionFailureLog.shared.record(
+                                messageID: messageId ?? messageUUID,
+                                subject: Self.headerValue("subject", in: data).map(Self.decodeMIMEWords),
+                                reason: reason + note,
+                                details: details)
+                            box.negativeCacheSize = data.count
+                        } else {
+                            // The host app now reports *why* rather than throwing an
+                            // opaque NSError, so there is something to show.
+                            log.error("decodedMessage: decrypt failed — \(reason, privacy: .public)")
+                            DecryptionFailureLog.shared.record(
+                                messageID: messageId ?? messageUUID,
+                                subject: Self.headerValue("subject", in: data).map(Self.decodeMIMEWords),
+                                reason: reason,
+                                details: details)
+                            box.set(isMIMEEncrypted
+                                ? Self.makeFailedDecodedMessage(reason: reason, status: status,
+                                                                original: data)
+                                : nil)
+                        }
                     } else {
                         box.set(Self.makeDecodedMessage(data: plaintext, status: status, wasEncrypted: true, banner: banner))
                     }
@@ -681,6 +715,13 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
                 reason: "Timed out after \(Int(Self.decodeTimeout))s waiting for the host app / GPG")
             return nil
         }
+        // Transient failure (encrypted part missing from a partially downloaded
+        // body): negative-cache at this size so the indexer's repeat calls don't
+        // re-run gpg, while a call with MORE bytes re-evaluates and decrypts.
+        if let size = box.negativeCacheSize {
+            storeNotMailGPGContent(for: cacheKey, size: size)
+            return nil
+        }
         let result = box.value
 
         // Cache the decoded result so subsequent calls (Mail's indexer often
@@ -705,8 +746,16 @@ class MessageSecurityHandler: NSObject, MEMessageSecurityHandler {
     private final class DecodeResultBox: @unchecked Sendable {
         private let lock = NSLock()
         private var stored: MEDecodedMessage?
+        private var _negativeCacheSize: Int?
         func set(_ value: MEDecodedMessage?) { lock.lock(); stored = value; lock.unlock() }
         var value: MEDecodedMessage? { lock.lock(); defer { lock.unlock() }; return stored }
+        /// When set, the caller should negative-cache the message at this size and
+        /// return nil — used for transient failures (partially downloaded body)
+        /// that must be retried once Mail supplies more bytes.
+        var negativeCacheSize: Int? {
+            get { lock.lock(); defer { lock.unlock() }; return _negativeCacheSize }
+            set { lock.lock(); _negativeCacheSize = newValue; lock.unlock() }
+        }
     }
 
     /// Build the `MEDecodedMessage` returned for a message we could not decrypt.

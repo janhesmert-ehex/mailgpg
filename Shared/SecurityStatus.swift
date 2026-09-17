@@ -32,21 +32,28 @@ struct DecryptionDetails: Equatable, Codable {
     var decryptionKeyFingerprint: String? = nil
     /// Key IDs from `NO_SECKEY` — encrypted to these, but we hold no secret key.
     var missingSecretKeyIDs: [String] = []
+    /// `true` when the failure is transient and worth retrying: the gpg-agent
+    /// died mid-operation (GPG Suite's shutdown-gpg-agent kills it on sleep/lock)
+    /// or the user dismissed the pinentry prompt. The extension must NOT cache a
+    /// permanent failure placeholder for these — the next attempt can succeed.
+    var transient: Bool? = nil
 
     var isEmpty: Bool {
         encryptedToKeyIDs.isEmpty && decryptionKeyFingerprint == nil && missingSecretKeyIDs.isEmpty
     }
 
     enum CodingKeys: String, CodingKey {
-        case encryptedToKeyIDs, decryptionKeyFingerprint, missingSecretKeyIDs
+        case encryptedToKeyIDs, decryptionKeyFingerprint, missingSecretKeyIDs, transient
     }
 
     init(encryptedToKeyIDs: [String] = [],
          decryptionKeyFingerprint: String? = nil,
-         missingSecretKeyIDs: [String] = []) {
+         missingSecretKeyIDs: [String] = [],
+         transient: Bool? = nil) {
         self.encryptedToKeyIDs = encryptedToKeyIDs
         self.decryptionKeyFingerprint = decryptionKeyFingerprint
         self.missingSecretKeyIDs = missingSecretKeyIDs
+        self.transient = transient
     }
 
     init(from decoder: Decoder) throws {
@@ -54,6 +61,7 @@ struct DecryptionDetails: Equatable, Codable {
         encryptedToKeyIDs = try c.decodeIfPresent([String].self, forKey: .encryptedToKeyIDs) ?? []
         decryptionKeyFingerprint = try c.decodeIfPresent(String.self, forKey: .decryptionKeyFingerprint)
         missingSecretKeyIDs = try c.decodeIfPresent([String].self, forKey: .missingSecretKeyIDs) ?? []
+        transient = try c.decodeIfPresent(Bool.self, forKey: .transient)
     }
 }
 

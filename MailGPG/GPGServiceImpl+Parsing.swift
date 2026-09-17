@@ -172,6 +172,7 @@ extension GPGServiceImpl {
         var decryptionFailed = false
         var details = DecryptionDetails()
         var signatureFailure: SecurityStatus? = nil
+        var failureCode: UInt32? = nil
 
         /// Whitespace-split of a `[GNUPG:] TOKEN arg…` line, starting at `[GNUPG:]`.
         func fields(_ line: String) -> [String] {
@@ -218,12 +219,18 @@ extension GPGServiceImpl {
             } else if line.contains("[GNUPG:] NO_PUBKEY") {
                 let keyID = p.count >= 3 ? p[2] : "unknown"
                 signatureFailure = signatureFailure ?? .keyNotFound(keyID: keyID)
+            } else if line.contains("[GNUPG:] FAILURE") || line.contains("[GNUPG:] ERROR") {
+                // "[GNUPG:] FAILURE decrypt 83886179" — the number is a full
+                // gpg-error value (source << 24 | code). Keep the FIRST one; later
+                // FAILURE lines repeat the same root cause.
+                if p.count >= 4, let n = UInt32(p[3]) { failureCode = failureCode ?? n }
             }
         }
 
         // A decryption problem outranks any signature verdict: without plaintext
         // there is nothing for a signature to be about.
         if decryptionFailed {
+            details.transient = Self.isTransientGPGError(failureCode)
             return .decryptionFailed(reason: Self.decryptionFailureReason(details: details),
                                      details: details)
         }
@@ -244,6 +251,33 @@ extension GPGServiceImpl {
         if isEncrypted { return .encrypted(signers: signers, details: details) }
         if !signers.isEmpty { return .signed(signers: signers) }
         return .plain
+    }
+
+    /// Whether a gpg-error value from a `[GNUPG:] FAILURE …` / `ERROR …` status
+    /// line describes a TRANSIENT condition rather than a property of the message.
+    ///
+    /// Transient means: retrying the exact same operation can succeed — the
+    /// gpg-agent died mid-operation (GPG Suite's shutdown-gpg-agent kills the
+    /// agent on sleep/lock; gpg restarts it on the next run) or the user
+    /// dismissed the pinentry prompt. These must never be recorded as permanent
+    /// failures of the message. Matching the numeric code keeps this
+    /// locale-independent — gpg's human-readable stderr is localized.
+    static func isTransientGPGError(_ fullCode: UInt32?) -> Bool {
+        guard let fullCode else { return false }
+        // Full gpg-error values are (source << 24 | code); the low 16 bits are
+        // the error code proper.
+        switch fullCode & 0xFFFF {
+        case 99, 198:    // GPG_ERR_CANCELED / FULLY_CANCELED — pinentry dismissed
+            return true
+        case 16383:      // GPG_ERR_EOF — agent connection died mid-operation
+            return true
+        case 190, 191:   // GPG_ERR_NO_AGENT / GPG_ERR_AGENT — agent unreachable
+            return true
+        case 257...281:  // GPG_ERR_ASS_* — Assuan IPC layer (agent socket) errors
+            return true
+        default:
+            return false
+        }
     }
 
     /// Turn the collected status details into a sentence the user can act on.
